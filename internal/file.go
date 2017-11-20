@@ -20,6 +20,7 @@ import (
 	"io"
 	"sync"
 	"syscall"
+	"runtime/debug"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -34,6 +35,7 @@ type FileHandle struct {
 	dirty     bool
 	writeInit sync.Once
 	mpuWG     sync.WaitGroup
+	sem       chan struct{}
 	etags     []*string
 
 	mu              sync.Mutex
@@ -79,7 +81,7 @@ func (fh *FileHandle) initMPU() {
 
 	fh.mpuKey = fh.inode.FullName()
 	fs := fh.inode.fs
-
+	fh.sem = make(chan struct{}, 36)
 	params := &s3.CreateMultipartUploadInput{
 		Bucket:       &fs.bucket,
 		Key:          fs.key(*fh.mpuKey),
@@ -154,6 +156,7 @@ func (fh *FileHandle) mpuPartNoSpawn(buf *MBuf, part int) (err error) {
 
 func (fh *FileHandle) mpuPart(buf *MBuf, part int) {
 	defer func() {
+		<-fh.sem 
 		fh.mpuWG.Done()
 	}()
 
@@ -191,11 +194,11 @@ func (fh *FileHandle) waitForCreateMPU() (err error) {
 
 func (fh *FileHandle) partSize() uint64 {
 	if fh.lastPartId < 1000 {
-		return 5 * 1024 * 1024
+		return 4 * 1024 * 1024
 	} else if fh.lastPartId < 2000 {
-		return 25 * 1024 * 1024
+		return 24 * 1024 * 1024
 	} else {
-		return 125 * 1024 * 1024
+		return 124 * 1024 * 1024
 	}
 }
 
@@ -243,8 +246,8 @@ func (fh *FileHandle) WriteFile(offset int64, data []byte) (err error) {
 			buf := fh.buf
 			fh.buf = nil
 			fh.mpuWG.Add(1)
-
 			go fh.mpuPart(buf, part)
+			fh.sem <- struct{}{}
 		}
 
 		if nCopied == len(data) {
@@ -448,10 +451,19 @@ func (fh *FileHandle) readFile(offset int64, buf []byte) (bytesRead int, err err
 	if fh.poolHandle == nil {
 		fh.poolHandle = fs.bufferPool
 	}
-
-	if fh.readBufOffset != offset {
+	resetStream := false
+	if fh.readBufOffset != offset  {
 		// XXX out of order read, maybe disable prefetching
 		fh.inode.logFuse("out of order read", offset, fh.readBufOffset)
+		resetStream = true
+	}
+
+	if fh.seqReadAmount >= 500*1024*1024 {
+		fh.inode.logFuse("reqReadAmount >= 500M, reset stream", offset)
+		resetStream = true
+	}
+
+	if resetStream {
 
 		fh.readBufOffset = offset
 		fh.seqReadAmount = 0
@@ -469,8 +481,13 @@ func (fh *FileHandle) readFile(offset int64, buf []byte) (bytesRead int, err err
 			b.buf.Close()
 		}
 		fh.buffers = nil
+		debug.FreeOSMemory()
 	}
 
+	bytesRead, err = fh.readFromStream(offset, buf)
+
+	return
+/*
 	if !fs.flags.Cheap && fh.seqReadAmount >= uint64(READAHEAD_CHUNK) && fh.numOOORead < 3 {
 		if fh.reader != nil {
 			fh.inode.logFuse("cutover to the parallel algorithm")
@@ -496,6 +513,7 @@ func (fh *FileHandle) readFile(offset int64, buf []byte) (bytesRead int, err err
 	bytesRead, err = fh.readFromStream(offset, buf)
 
 	return
+*/
 }
 
 func (fh *FileHandle) Release() {

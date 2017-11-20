@@ -37,7 +37,7 @@ type BufferPool struct {
 	pool *sync.Pool
 }
 
-const BUF_SIZE = 5 * 1024 * 1024
+const BUF_SIZE = 4 * 1024 * 1024
 
 func maxMemToUse(buffersNow uint64) uint64 {
 	m, err := mem.VirtualMemory()
@@ -136,9 +136,9 @@ func (pool *BufferPool) RequestMultiple(size uint64, block bool) (buffers [][]by
 }
 
 func (pool *BufferPool) MaybeGC() {
-	if pool.numBuffers == 0 {
+	//if pool.numBuffers == 0 {
 		debug.FreeOSMemory()
-	}
+	//}
 }
 
 func (pool *BufferPool) Free(buf []byte) {
@@ -148,6 +148,9 @@ func (pool *BufferPool) Free(buf []byte) {
 	buf = buf[:0]
 	pool.pool.Put(buf)
 	pool.numBuffers--
+	if pool.numBuffers%10 == 0 {
+		debug.FreeOSMemory()
+	}
 	pool.cond.Signal()
 }
 
